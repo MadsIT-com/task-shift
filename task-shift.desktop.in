@@ -2,7 +2,7 @@
 Type=Application
 Name=TaskShift
 GenericName=Systemd Timer Manager
-Comment=Manage Debian scheduled tasks through a familiar KDE interface
+Comment=View, reschedule, and control Debian systemd timers from KDE
 Exec=@TASK_SHIFT_EXEC@
 Icon=view-calendar-tasks
 Terminal=false

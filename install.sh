@@ -13,7 +13,7 @@ DESKTOP_TEMP=$(mktemp "${TMPDIR:-/tmp}/task-shift.desktop.XXXXXX")
 trap 'rm -f "$DESKTOP_TEMP"' EXIT HUP INT TERM
 
 missing=""
-for command_name in python3 systemctl; do
+for command_name in pkexec python3 systemctl systemd-analyze; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         missing="$missing $command_name"
     fi
@@ -23,7 +23,7 @@ if ! /usr/bin/python3 -c 'import PyQt6' >/dev/null 2>&1; then
 fi
 if [ -n "$missing" ]; then
     printf 'Missing dependencies:%s\n' "$missing" >&2
-    printf '%s\n' 'On Debian 13: sudo apt install python3-pyqt6 systemd' >&2
+    printf '%s\n' 'On Debian 13: sudo apt install pkexec python3-pyqt6 systemd' >&2
     exit 1
 fi
 

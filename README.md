@@ -8,7 +8,7 @@ systemd timers. It gives Windows administrators a familiar scheduled-task
 overview while leaving scheduling, execution, and authorization with Debian's
 native systemd packages.
 
-**Current private preview: 0.1.0**
+**Current private preview: 0.2.0**
 
 ## Behavior
 
@@ -17,20 +17,47 @@ native systemd packages.
 - Filters by timer name, activated service, and state.
 - Starts or stops a timer and enables or disables its automatic startup.
 - Runs the service reported by systemd only after an explicit confirmation.
+- Changes schedules with familiar Daily, Weekly, Monthly, and Repeat controls,
+  plus a custom systemd calendar option for experienced users.
+- Validates calendar expressions with `systemd-analyze` and previews the next
+  three runs before anything is written.
+- Stores schedule changes in a named TaskShift drop-in without rewriting the
+  package-provided timer file or unrelated administrator drop-ins.
+- Restores original scheduling semantics by neutralizing only TaskShift's
+  named drop-in.
 - Uses allowlisted `systemctl` arguments without invoking a shell.
 - Lets KDE and PolicyKit handle administrator authentication. TaskShift never
   asks for or handles an administrator password.
 - Saves no timer inventory, search history, selected unit, or action history.
 
-This preview deliberately does not create, edit, or delete timers and service
-units. A responsible task editor must explain the two-unit model, file
-ownership, calendar syntax, daemon reloads, validation, and rollback before it
-writes anything.
+This preview changes when an existing timer runs, but deliberately does not
+create or delete timer and service units. Creating a complete task still needs
+a design that explains the two-unit model, file ownership, command execution,
+validation, and rollback before it writes anything.
+
+## Editing schedules safely
+
+TaskShift never edits the original timer beneath `/usr/lib/systemd/system` or
+an administrator's unrelated drop-in. It uses systemd's native
+`systemctl edit --stdin --drop-in=50-task-shift.conf` workflow.
+
+For system timers, Debian's `pkexec` package asks PolicyKit to show KDE's normal
+administrator-authentication dialog. User timers are edited without elevation.
+Generated drop-in content resets the timer's prior trigger expressions and adds
+the selected replacement schedule; systemd reloads its configuration and the
+active timer is restarted so its next run updates immediately.
+
+Existing `RandomizedDelaySec` and `AccuracySec` settings remain in effect by
+default. This is important for distribution timers that deliberately spread
+network or disk work over a time window. Selecting **Run as close as possible**
+explicitly overrides those values with zero randomized delay and one-second
+accuracy. Calendar schedules can also choose whether one missed occurrence is
+run after the machine starts again.
 
 ## Installation on Debian 13
 
 ```sh
-sudo apt install git python3-pyqt6 systemd
+sudo apt install git pkexec python3-pyqt6 systemd
 git clone https://github.com/MadsIT-com/task-shift.git
 cd task-shift
 ./install.sh
@@ -44,6 +71,8 @@ remove the wrapper:
 ```
 
 Uninstalling TaskShift does not change timers, services, or systemd settings.
+Any active TaskShift schedule overrides therefore remain effective. Use
+**Restore original** before uninstalling when an override is no longer wanted.
 
 ## Updates stay with Debian
 
@@ -62,7 +91,8 @@ shellcheck install.sh uninstall.sh
 ## Security boundary
 
 Timer names and schedules are machine configuration rather than credentials,
-but TaskShift still avoids creating another persistent inventory. Actions are
+but TaskShift still avoids creating another inventory or action history. An
+intentional schedule override is persistent system configuration. Actions are
 limited to units returned by systemd and authorization remains with systemd
 and PolicyKit. “Run task now” starts the activated service immediately and can
 therefore perform updates, cleanup, or other work. See

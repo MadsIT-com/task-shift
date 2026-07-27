@@ -12,6 +12,9 @@ Before submitting a change:
 5. Confirm no machine-specific timer data, logs, credentials, or test secrets
    entered the repository.
 6. Keep systemctl actions allowlisted, shell-free, and subject to PolicyKit.
+7. Keep schedule writes limited to `50-task-shift.conf`, validate custom
+   calendars with `systemd-analyze`, and preserve an explicit rollback path.
 
-Systemd must remain the scheduler. Unit-file creation and editing are outside
-the private preview's scope.
+Systemd must remain the scheduler. Complete task creation, arbitrary unit-file
+editing, and arbitrary command execution are outside the private preview's
+scope.
