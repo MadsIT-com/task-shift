@@ -7,17 +7,21 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
+from pathlib import Path
 import re
 import shlex
 import subprocess
 import sys
 from typing import Callable
 
-from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QThread, QTime, QTimer, Qt
 from PyQt6.QtGui import QCloseEvent, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -28,16 +32,22 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
 
 TITLE = "TaskShift"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SYSTEMCTL = "/usr/bin/systemctl"
+SYSTEMD_ANALYZE = "/usr/bin/systemd-analyze"
+PKEXEC = "/usr/bin/pkexec"
+TASKSHIFT_DROP_IN = "50-task-shift.conf"
 TIMER_PATTERN = re.compile(r"[A-Za-z0-9_.:@-]+\.timer")
 SERVICE_PATTERN = re.compile(r"[A-Za-z0-9_.:@-]+\.service")
 SCOPES = ("system", "user")
@@ -68,6 +78,29 @@ class TimerUnit:
         if self.active_state:
             return self.active_state.capitalize()
         return "Not loaded"
+
+
+@dataclass(frozen=True)
+class TimerDetails:
+    calendar: str
+    monotonic: str
+    persistent: bool
+    randomized_delay: str
+    accuracy: str
+    taskshift_override: bool
+
+    @property
+    def schedule_summary(self) -> str:
+        parts = [value for value in (self.calendar, self.monotonic) if value]
+        return "\n".join(parts) if parts else "No active schedule expression reported."
+
+
+@dataclass(frozen=True)
+class ScheduleSpec:
+    directive: str
+    value: str
+    persistent: bool = False
+    exact: bool = False
 
 
 def qt_application() -> QApplication:
@@ -145,6 +178,165 @@ def run_systemctl(scope: str, *arguments: str) -> str:
         message = result.stderr.strip() or result.stdout.strip()
         raise TaskShiftError(message or "systemctl did not complete successfully.")
     return result.stdout
+
+
+def systemctl_edit_arguments(scope: str, unit_name: str) -> list[str]:
+    validate_scope(scope)
+    validate_timer_name(unit_name)
+    command = [SYSTEMCTL]
+    if scope == "system":
+        command.insert(0, PKEXEC)
+    else:
+        command.append("--user")
+    command.extend(
+        ("edit", f"--drop-in={TASKSHIFT_DROP_IN}", "--stdin", unit_name)
+    )
+    return command
+
+
+def write_schedule_drop_in(scope: str, unit_name: str, contents: str) -> None:
+    validate_scope(scope)
+    validate_timer_name(unit_name)
+    if len(contents.encode("utf-8")) > 4096 or "\x00" in contents:
+        raise TaskShiftError("The generated schedule override is invalid.")
+    environment = os.environ.copy()
+    environment.update({"LC_ALL": "C", "SYSTEMD_PAGER": ""})
+    try:
+        result = subprocess.run(
+            systemctl_edit_arguments(scope, unit_name),
+            input=contents,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=180,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TaskShiftError(f"The schedule override could not be written: {exc}") from exc
+    if result.returncode != 0:
+        if result.returncode in {126, 127}:
+            raise TaskShiftError("Administrator authentication was cancelled.")
+        message = result.stderr.strip() or result.stdout.strip()
+        raise TaskShiftError(message or "The schedule override was not accepted.")
+
+
+def validate_calendar(expression: str) -> tuple[str, str]:
+    expression = expression.strip()
+    if (
+        not expression
+        or len(expression) > 512
+        or any(character in expression for character in ("\n", "\r", "\x00"))
+    ):
+        raise TaskShiftError("Enter one valid systemd calendar expression.")
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    try:
+        result = subprocess.run(
+            [SYSTEMD_ANALYZE, "calendar", "--iterations=3", "--", expression],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=10,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TaskShiftError(f"The calendar expression could not be checked: {exc}") from exc
+    if result.returncode != 0:
+        message = result.stderr.strip() or "systemd rejected the calendar expression."
+        raise TaskShiftError(message)
+    match = re.search(r"^Normalized form:\s*(.+)$", result.stdout, re.MULTILINE)
+    normalized = match.group(1).strip() if match else expression
+    return normalized, result.stdout.strip()
+
+
+def schedule_drop_in(specification: ScheduleSpec) -> str:
+    lines = ["# Managed by TaskShift: active", "[Timer]", "OnCalendar="]
+    if specification.directive == "OnCalendar":
+        normalized, _ = validate_calendar(specification.value)
+        lines.append(f"OnCalendar={normalized}")
+        lines.append(f"Persistent={'yes' if specification.persistent else 'no'}")
+    elif specification.directive == "OnUnitActiveSec":
+        if not re.fullmatch(r"[1-9][0-9]{0,5}min", specification.value):
+            raise TaskShiftError("The repeat interval is invalid.")
+        minutes = int(specification.value.removesuffix("min"))
+        if not 1 <= minutes <= 10080:
+            raise TaskShiftError("Choose an interval from 1 minute through 7 days.")
+        lines.extend(
+            (
+                f"OnActiveSec={minutes}min",
+                f"OnUnitActiveSec={minutes}min",
+            )
+        )
+    else:
+        raise TaskShiftError("The requested schedule type is not allowed.")
+    if specification.exact:
+        lines.extend(("RandomizedDelaySec=0", "AccuracySec=1s"))
+    return "\n".join(lines) + "\n"
+
+
+def restored_drop_in() -> str:
+    return (
+        "# Managed by TaskShift: restored\n"
+        "# This no-op drop-in preserves the original timer schedule.\n"
+        "[Timer]\n"
+    )
+
+
+def apply_schedule(scope: str, timer: TimerUnit, specification: ScheduleSpec) -> None:
+    validate_timer_name(timer.name)
+    write_schedule_drop_in(scope, timer.name, schedule_drop_in(specification))
+    run_systemctl(scope, "try-restart", timer.name)
+
+
+def restore_schedule(scope: str, timer: TimerUnit) -> None:
+    validate_timer_name(timer.name)
+    write_schedule_drop_in(scope, timer.name, restored_drop_in())
+    run_systemctl(scope, "try-restart", timer.name)
+
+
+def humanize_timer_property(value: str) -> str:
+    return (
+        value.replace("{ ", "")
+        .replace(" }", "")
+        .replace(" ; next_elapse=", " → next ")
+        .strip()
+    )
+
+
+def load_timer_details(scope: str, unit_name: str) -> TimerDetails:
+    validate_timer_name(unit_name)
+    output = run_systemctl(
+        scope,
+        "show",
+        unit_name,
+        "--no-pager",
+        "--property=TimersCalendar,TimersMonotonic,Persistent,RandomizedDelayUSec,AccuracyUSec,DropInPaths",
+    )
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    managed = False
+    for path_text in values.get("DropInPaths", "").split():
+        if not path_text.endswith(f"/{TASKSHIFT_DROP_IN}"):
+            continue
+        try:
+            contents = Path(path_text).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        managed = "# Managed by TaskShift: active" in contents
+    return TimerDetails(
+        calendar=humanize_timer_property(values.get("TimersCalendar", "")),
+        monotonic=humanize_timer_property(values.get("TimersMonotonic", "")),
+        persistent=values.get("Persistent", "no") == "yes",
+        randomized_delay=values.get("RandomizedDelayUSec", "unknown"),
+        accuracy=values.get("AccuracyUSec", "unknown"),
+        taskshift_override=managed,
+    )
 
 
 def microseconds(value: object) -> int:
@@ -296,22 +488,253 @@ def action_command(scope: str, timer: TimerUnit, action: str) -> str:
     return display_command(scope, action, timer.name)
 
 
-class BackgroundJob(QThread):
-    succeeded = pyqtSignal(object)
-    failed = pyqtSignal(str)
+class ScheduleDialog(QDialog):
+    def __init__(self, timer: TimerUnit, details: TimerDetails, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.timer = timer
+        self.details = details
+        self.specification: ScheduleSpec | None = None
+        self.setWindowTitle(f"Edit schedule — {timer.name}")
+        self.setMinimumWidth(680)
 
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        heading = QLabel(f"<b>Change when {timer.name} runs</b>")
+        explanation = QLabel(
+            "TaskShift creates one named systemd drop-in and leaves Debian's "
+            "original timer file untouched. Restore original schedule neutralizes "
+            "only the TaskShift drop-in."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(explanation)
+
+        current_group = QGroupBox("Current effective schedule")
+        current_form = QFormLayout(current_group)
+        current_form.setHorizontalSpacing(12)
+        current_form.setVerticalSpacing(8)
+        current_schedule = QLabel(details.schedule_summary)
+        current_schedule.setWordWrap(True)
+        current_schedule.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        current_form.addRow("Triggers:", current_schedule)
+        current_form.addRow("Catch up missed runs:", QLabel("Yes" if details.persistent else "No"))
+        current_form.addRow("Randomized delay:", QLabel(details.randomized_delay))
+        current_form.addRow("Accuracy window:", QLabel(details.accuracy))
+        layout.addWidget(current_group)
+
+        schedule_group = QGroupBox("New schedule")
+        schedule_layout = QVBoxLayout(schedule_group)
+        schedule_layout.setSpacing(10)
+        type_layout = QFormLayout()
+        self.schedule_type = QComboBox()
+        self.schedule_type.addItem("Daily", "daily")
+        self.schedule_type.addItem("Weekly", "weekly")
+        self.schedule_type.addItem("Monthly", "monthly")
+        self.schedule_type.addItem("Repeat at an interval", "interval")
+        self.schedule_type.addItem("Custom systemd calendar", "custom")
+        type_layout.addRow("Schedule type:", self.schedule_type)
+        schedule_layout.addLayout(type_layout)
+
+        self.schedule_stack = QStackedWidget()
+
+        daily_panel = QWidget()
+        daily_form = QFormLayout(daily_panel)
+        self.daily_time = QTimeEdit(QTime(9, 0))
+        self.daily_time.setDisplayFormat("HH:mm")
+        daily_form.addRow("Run every day at:", self.daily_time)
+        self.schedule_stack.addWidget(daily_panel)
+
+        weekly_panel = QWidget()
+        weekly_form = QFormLayout(weekly_panel)
+        self.weekday = QComboBox()
+        for label, value in (
+            ("Monday", "Mon"),
+            ("Tuesday", "Tue"),
+            ("Wednesday", "Wed"),
+            ("Thursday", "Thu"),
+            ("Friday", "Fri"),
+            ("Saturday", "Sat"),
+            ("Sunday", "Sun"),
+        ):
+            self.weekday.addItem(label, value)
+        self.weekly_time = QTimeEdit(QTime(9, 0))
+        self.weekly_time.setDisplayFormat("HH:mm")
+        weekly_form.addRow("Day:", self.weekday)
+        weekly_form.addRow("Time:", self.weekly_time)
+        self.schedule_stack.addWidget(weekly_panel)
+
+        monthly_panel = QWidget()
+        monthly_form = QFormLayout(monthly_panel)
+        self.month_day = QSpinBox()
+        self.month_day.setRange(1, 31)
+        self.month_day.setValue(1)
+        self.monthly_time = QTimeEdit(QTime(9, 0))
+        self.monthly_time.setDisplayFormat("HH:mm")
+        monthly_form.addRow("Day of month:", self.month_day)
+        monthly_form.addRow("Time:", self.monthly_time)
+        self.schedule_stack.addWidget(monthly_panel)
+
+        interval_panel = QWidget()
+        interval_form = QFormLayout(interval_panel)
+        self.interval_minutes = QSpinBox()
+        self.interval_minutes.setRange(1, 10080)
+        self.interval_minutes.setValue(60)
+        self.interval_minutes.setSuffix(" minutes")
+        interval_note = QLabel(
+            "The first run occurs after this delay; later runs are measured from "
+            "the activated unit's previous run."
+        )
+        interval_note.setWordWrap(True)
+        interval_form.addRow("Repeat every:", self.interval_minutes)
+        interval_form.addRow("", interval_note)
+        self.schedule_stack.addWidget(interval_panel)
+
+        custom_panel = QWidget()
+        custom_form = QFormLayout(custom_panel)
+        self.custom_calendar = QLineEdit()
+        self.custom_calendar.setPlaceholderText("For example: Mon..Fri *-*-* 09:00:00")
+        custom_note = QLabel(
+            "Custom input is passed only to systemd-analyze for validation and is "
+            "never interpreted by a shell."
+        )
+        custom_note.setWordWrap(True)
+        custom_form.addRow("OnCalendar:", self.custom_calendar)
+        custom_form.addRow("", custom_note)
+        self.schedule_stack.addWidget(custom_panel)
+        schedule_layout.addWidget(self.schedule_stack)
+        layout.addWidget(schedule_group)
+
+        options_group = QGroupBox("Timing behavior")
+        options_layout = QVBoxLayout(options_group)
+        self.persistent = QCheckBox("Run one missed occurrence after the machine starts again")
+        self.persistent.setChecked(details.persistent)
+        self.exact = QCheckBox("Run as close as possible to the selected time")
+        exact_note = QLabel(
+            "When enabled, TaskShift sets RandomizedDelaySec=0 and AccuracySec=1s. "
+            "Leave it off to preserve the timer's Debian-provided delay and accuracy settings."
+        )
+        exact_note.setWordWrap(True)
+        options_layout.addWidget(self.persistent)
+        options_layout.addWidget(self.exact)
+        options_layout.addWidget(exact_note)
+        layout.addWidget(options_group)
+
+        preview_group = QGroupBox("Validated preview")
+        preview_layout = QVBoxLayout(preview_group)
+        self.expression_preview = QLineEdit()
+        self.expression_preview.setReadOnly(True)
+        self.next_runs = QLabel()
+        self.next_runs.setWordWrap(True)
+        self.next_runs.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        preview_layout.addWidget(self.expression_preview)
+        preview_layout.addWidget(self.next_runs)
+        layout.addWidget(preview_group)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Apply
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Apply).setText("Apply schedule")
+        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.schedule_type.currentIndexChanged.connect(self.schedule_changed)
+        self.daily_time.timeChanged.connect(self.update_preview)
+        self.weekday.currentIndexChanged.connect(self.update_preview)
+        self.weekly_time.timeChanged.connect(self.update_preview)
+        self.month_day.valueChanged.connect(self.update_preview)
+        self.monthly_time.timeChanged.connect(self.update_preview)
+        self.interval_minutes.valueChanged.connect(self.update_preview)
+        self.custom_calendar.textChanged.connect(self.update_preview)
+        self.schedule_changed()
+
+    @staticmethod
+    def time_text(editor: QTimeEdit) -> str:
+        return editor.time().toString("HH:mm")
+
+    def values(self) -> ScheduleSpec:
+        schedule_type = str(self.schedule_type.currentData())
+        if schedule_type == "daily":
+            value = f"*-*-* {self.time_text(self.daily_time)}:00"
+        elif schedule_type == "weekly":
+            value = (
+                f"{self.weekday.currentData()} *-*-* "
+                f"{self.time_text(self.weekly_time)}:00"
+            )
+        elif schedule_type == "monthly":
+            value = (
+                f"*-*-{self.month_day.value():02d} "
+                f"{self.time_text(self.monthly_time)}:00"
+            )
+        elif schedule_type == "interval":
+            return ScheduleSpec(
+                "OnUnitActiveSec",
+                f"{self.interval_minutes.value()}min",
+                exact=self.exact.isChecked(),
+            )
+        elif schedule_type == "custom":
+            value = self.custom_calendar.text()
+        else:
+            raise TaskShiftError("Choose a valid schedule type.")
+        normalized, _ = validate_calendar(value)
+        return ScheduleSpec(
+            "OnCalendar",
+            normalized,
+            persistent=self.persistent.isChecked(),
+            exact=self.exact.isChecked(),
+        )
+
+    def schedule_changed(self) -> None:
+        self.schedule_stack.setCurrentIndex(self.schedule_type.currentIndex())
+        is_calendar = self.schedule_type.currentData() != "interval"
+        self.persistent.setEnabled(is_calendar)
+        self.update_preview()
+
+    def update_preview(self) -> None:
+        try:
+            specification = self.values()
+            if specification.directive == "OnCalendar":
+                normalized, preview = validate_calendar(specification.value)
+                self.expression_preview.setText(f"OnCalendar={normalized}")
+                self.next_runs.setText(preview)
+            else:
+                self.expression_preview.setText(
+                    f"OnActiveSec={specification.value}; "
+                    f"OnUnitActiveSec={specification.value}"
+                )
+                self.next_runs.setText(
+                    "Monotonic interval: the timer runs after the selected delay "
+                    "and repeats relative to activation."
+                )
+        except TaskShiftError as exc:
+            self.expression_preview.clear()
+            self.next_runs.setText(str(exc))
+
+    def accept(self) -> None:
+        try:
+            self.specification = self.values()
+        except TaskShiftError as exc:
+            QMessageBox.critical(self, TITLE, str(exc))
+            return
+        super().accept()
+
+
+class BackgroundJob(QThread):
     def __init__(self, function: Callable[..., object], *arguments: object) -> None:
         super().__init__()
         self.function = function
         self.arguments = arguments
+        self.result: object | None = None
+        self.error = ""
 
     def run(self) -> None:
         try:
-            result = self.function(*self.arguments)
+            self.result = self.function(*self.arguments)
         except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.succeeded.emit(result)
+            self.error = str(exc)
 
 
 class TaskWindow(QMainWindow):
@@ -332,8 +755,8 @@ class TaskWindow(QMainWindow):
         heading = QLabel("<b>Manage scheduled systemd tasks</b>")
         explanation = QLabel(
             "A Task Scheduler-style view of existing Debian timers. TaskShift "
-            "stores no task inventory or history and does not create or rewrite "
-            "timer files in this preview."
+            "stores no task inventory or history. Schedule changes use a separate "
+            "systemd drop-in and never rewrite Debian's original timer file."
         )
         explanation.setWordWrap(True)
         self.main_layout.addWidget(heading)
@@ -399,12 +822,37 @@ class TaskWindow(QMainWindow):
         details_layout.addLayout(details_form)
 
         action_layout = QHBoxLayout()
-        action_layout.setSpacing(8)
+        action_layout.setSpacing(10)
+
+        session_group = QGroupBox("Current session")
+        session_layout = QHBoxLayout(session_group)
+        session_layout.setSpacing(8)
         self.start_button = QPushButton("Start timer")
         self.stop_button = QPushButton("Stop timer")
         self.run_button = QPushButton("Run task now")
+        for button in (self.start_button, self.stop_button, self.run_button):
+            session_layout.addWidget(button)
+
+        startup_group = QGroupBox("Automatic startup")
+        startup_layout = QHBoxLayout(startup_group)
+        startup_layout.setSpacing(8)
         self.enable_button = QPushButton("Enable at startup")
         self.disable_button = QPushButton("Disable at startup")
+        startup_layout.addWidget(self.enable_button)
+        startup_layout.addWidget(self.disable_button)
+
+        schedule_group = QGroupBox("Schedule")
+        schedule_actions = QHBoxLayout(schedule_group)
+        schedule_actions.setSpacing(8)
+        self.edit_schedule_button = QPushButton("Edit schedule…")
+        self.restore_schedule_button = QPushButton("Restore original")
+        self.edit_schedule_button.setEnabled(False)
+        self.restore_schedule_button.setEnabled(False)
+        self.edit_schedule_button.clicked.connect(self.edit_schedule)
+        self.restore_schedule_button.clicked.connect(self.restore_original_schedule)
+        schedule_actions.addWidget(self.edit_schedule_button)
+        schedule_actions.addWidget(self.restore_schedule_button)
+
         self.action_buttons = {
             "start": self.start_button,
             "stop": self.stop_button,
@@ -415,8 +863,9 @@ class TaskWindow(QMainWindow):
         for action, button in self.action_buttons.items():
             button.setEnabled(False)
             button.clicked.connect(lambda checked=False, name=action: self.run_action(name))
-            action_layout.addWidget(button)
-        action_layout.addStretch(1)
+        action_layout.addWidget(session_group)
+        action_layout.addWidget(startup_group)
+        action_layout.addWidget(schedule_group)
         details_layout.addLayout(action_layout)
         self.main_layout.addWidget(self.details_group)
 
@@ -456,6 +905,8 @@ class TaskWindow(QMainWindow):
         self.scope.setEnabled(False)
         for button in self.action_buttons.values():
             button.setEnabled(False)
+        self.edit_schedule_button.setEnabled(False)
+        self.restore_schedule_button.setEnabled(False)
 
     def clear_busy(self, message: str) -> None:
         self.status.setText(message)
@@ -477,18 +928,16 @@ class TaskWindow(QMainWindow):
         job = BackgroundJob(function, *arguments)
         self.job = job
 
-        def succeeded(result: object) -> None:
+        def finished() -> None:
             self.job = None
-            on_success(result)
+            if job.error:
+                self.clear_busy("The operation did not complete")
+                QMessageBox.critical(self, TITLE, job.error)
+            else:
+                on_success(job.result)
+            job.deleteLater()
 
-        def failed(message_text: str) -> None:
-            self.job = None
-            self.clear_busy("The operation did not complete")
-            QMessageBox.critical(self, TITLE, message_text)
-
-        job.succeeded.connect(succeeded)
-        job.failed.connect(failed)
-        job.finished.connect(job.deleteLater)
+        job.finished.connect(finished)
         job.start()
 
     def refresh(self) -> None:
@@ -544,6 +993,8 @@ class TaskWindow(QMainWindow):
             if action == "run-now" and timer is not None:
                 enabled = enabled and bool(timer.activates)
             button.setEnabled(enabled)
+        self.edit_schedule_button.setEnabled(timer is not None and not busy)
+        self.restore_schedule_button.setEnabled(timer is not None and not busy)
         if timer is None:
             self.selected_timer.setText("Select a timer")
             self.selected_target.setText("—")
@@ -557,6 +1008,103 @@ class TaskWindow(QMainWindow):
         )
         self.command_preview.setText(
             display_command(self.current_scope(), "status", timer.name)
+        )
+
+    def edit_schedule(self) -> None:
+        timer = self.selected()
+        if timer is None:
+            return
+        scope = self.current_scope()
+
+        def details_loaded(result: object) -> None:
+            assert isinstance(result, TimerDetails)
+            self.clear_busy(f"Loaded schedule details for {timer.name}")
+            dialog = ScheduleDialog(timer, result, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            specification = dialog.specification
+            if specification is None:
+                return
+            try:
+                drop_in = schedule_drop_in(specification)
+            except TaskShiftError as exc:
+                QMessageBox.critical(self, TITLE, str(exc))
+                return
+            answer = QMessageBox.question(
+                self,
+                TITLE,
+                "Apply this validated schedule override?\n\n"
+                f"Timer: {timer.name}\nScope: {scope}\n\n{drop_in}\n"
+                "Debian's original timer file will remain unchanged.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+            def applied(_: object) -> None:
+                self.clear_busy(f"Updated schedule for {timer.name}")
+                QTimer.singleShot(0, self.refresh)
+
+            self.start_job(
+                apply_schedule,
+                (scope, timer, specification),
+                f"Updating {timer.name}… KDE may request administrator authentication.",
+                applied,
+            )
+
+        self.start_job(
+            load_timer_details,
+            (scope, timer.name),
+            f"Reading the effective schedule for {timer.name}…",
+            details_loaded,
+        )
+
+    def restore_original_schedule(self) -> None:
+        timer = self.selected()
+        if timer is None:
+            return
+        scope = self.current_scope()
+
+        def details_loaded(result: object) -> None:
+            assert isinstance(result, TimerDetails)
+            self.clear_busy(f"Loaded schedule details for {timer.name}")
+            if not result.taskshift_override:
+                QMessageBox.information(
+                    self,
+                    TITLE,
+                    "This timer has no active TaskShift schedule override. "
+                    "Other administrator or package drop-ins were not changed.",
+                )
+                return
+            answer = QMessageBox.question(
+                self,
+                TITLE,
+                f"Restore the original effective schedule for {timer.name}?\n\n"
+                "Only TaskShift's named drop-in will be neutralized. Debian's "
+                "timer file and unrelated administrator drop-ins remain untouched.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+            def restored(_: object) -> None:
+                self.clear_busy(f"Restored the original schedule for {timer.name}")
+                QTimer.singleShot(0, self.refresh)
+
+            self.start_job(
+                restore_schedule,
+                (scope, timer),
+                f"Restoring {timer.name}… KDE may request administrator authentication.",
+                restored,
+            )
+
+        self.start_job(
+            load_timer_details,
+            (scope, timer.name),
+            f"Checking TaskShift's schedule override for {timer.name}…",
+            details_loaded,
         )
 
     def run_action(self, action: str) -> None:

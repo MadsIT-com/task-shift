@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -109,6 +110,91 @@ class CommandTests(unittest.TestCase):
             "systemctl --user start backup.service",
         )
 
+    def test_schedule_editor_uses_pkexec_only_for_system_scope(self) -> None:
+        self.assertEqual(
+            task_shift.systemctl_edit_arguments("system", "backup.timer"),
+            [
+                task_shift.PKEXEC,
+                task_shift.SYSTEMCTL,
+                "edit",
+                f"--drop-in={task_shift.TASKSHIFT_DROP_IN}",
+                "--stdin",
+                "backup.timer",
+            ],
+        )
+        self.assertEqual(
+            task_shift.systemctl_edit_arguments("user", "backup.timer"),
+            [
+                task_shift.SYSTEMCTL,
+                "--user",
+                "edit",
+                f"--drop-in={task_shift.TASKSHIFT_DROP_IN}",
+                "--stdin",
+                "backup.timer",
+            ],
+        )
+
+    @mock.patch.object(task_shift.subprocess, "run")
+    def test_drop_in_is_passed_on_stdin_without_a_shell(self, run: mock.Mock) -> None:
+        run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        contents = "# Managed by TaskShift: restored\n[Timer]\n"
+        task_shift.write_schedule_drop_in("system", "backup.timer", contents)
+        self.assertEqual(
+            run.call_args.args[0],
+            task_shift.systemctl_edit_arguments("system", "backup.timer"),
+        )
+        self.assertEqual(run.call_args.kwargs["input"], contents)
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+
+class ScheduleTests(unittest.TestCase):
+    def test_calendar_schedule_resets_existing_triggers_and_can_be_exact(self) -> None:
+        drop_in = task_shift.schedule_drop_in(
+            task_shift.ScheduleSpec(
+                "OnCalendar", "Mon..Fri *-*-* 09:00:00", True, True
+            )
+        )
+        self.assertIn("OnCalendar=\n", drop_in)
+        self.assertIn("OnCalendar=Mon..Fri *-*-* 09:00:00", drop_in)
+        self.assertIn("Persistent=yes", drop_in)
+        self.assertIn("RandomizedDelaySec=0", drop_in)
+        self.assertIn("AccuracySec=1s", drop_in)
+
+    def test_interval_schedule_uses_only_generated_numeric_duration(self) -> None:
+        drop_in = task_shift.schedule_drop_in(
+            task_shift.ScheduleSpec("OnUnitActiveSec", "45min")
+        )
+        self.assertIn("OnActiveSec=45min", drop_in)
+        self.assertIn("OnUnitActiveSec=45min", drop_in)
+        with self.assertRaises(task_shift.TaskShiftError):
+            task_shift.schedule_drop_in(
+                task_shift.ScheduleSpec("OnUnitActiveSec", "5min\nExecStart=/bin/sh")
+            )
+
+    def test_calendar_input_rejects_newline_injection(self) -> None:
+        with self.assertRaises(task_shift.TaskShiftError):
+            task_shift.validate_calendar("daily\nExecStart=/bin/sh")
+
+    @mock.patch.object(task_shift, "run_systemctl")
+    def test_details_detect_only_an_active_taskshift_drop_in(
+        self, run_systemctl: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / task_shift.TASKSHIFT_DROP_IN
+            path.write_text(
+                "# Managed by TaskShift: active\n[Timer]\nOnCalendar=\nOnCalendar=daily\n",
+                encoding="utf-8",
+            )
+            run_systemctl.return_value = (
+                "TimersCalendar={ OnCalendar=daily ; next_elapse=tomorrow }\n"
+                "TimersMonotonic=\nPersistent=yes\nRandomizedDelayUSec=0\n"
+                f"AccuracyUSec=1s\nDropInPaths={path}\n"
+            )
+            details = task_shift.load_timer_details("system", "backup.timer")
+        self.assertTrue(details.taskshift_override)
+        self.assertTrue(details.persistent)
+        self.assertIn("OnCalendar=daily", details.calendar)
+
 
 class UserInterfaceTests(unittest.TestCase):
     @classmethod
@@ -120,6 +206,12 @@ class UserInterfaceTests(unittest.TestCase):
         self.assertEqual(window.find_group.title(), "Find scheduled tasks")
         self.assertEqual(window.timers_group.title(), "Scheduled tasks")
         self.assertEqual(window.details_group.title(), "Selected scheduled task")
+        group_titles = {
+            group.title() for group in window.findChildren(task_shift.QGroupBox)
+        }
+        self.assertTrue(
+            {"Current session", "Automatic startup", "Schedule"}.issubset(group_titles)
+        )
         self.assertGreaterEqual(window.minimumWidth(), 980)
         margins = window.main_layout.contentsMargins()
         self.assertEqual(
@@ -127,6 +219,32 @@ class UserInterfaceTests(unittest.TestCase):
             (20, 18, 20, 16),
         )
         window.close()
+
+    @mock.patch.object(
+        task_shift,
+        "validate_calendar",
+        side_effect=lambda value: (value.strip(), "Three validated future runs"),
+    )
+    def test_schedule_dialog_builds_familiar_weekly_schedule(
+        self, validate_calendar: mock.Mock
+    ) -> None:
+        timer = task_shift.TimerUnit(
+            "backup.timer", "backup.service", 0, 0, "active", "waiting", "enabled"
+        )
+        details = task_shift.TimerDetails(
+            "OnCalendar=daily", "", True, "12h", "1min", False
+        )
+        parent = task_shift.TaskWindow(autoload=False)
+        dialog = task_shift.ScheduleDialog(timer, details, parent)
+        dialog.schedule_type.setCurrentIndex(1)
+        dialog.weekday.setCurrentIndex(4)
+        dialog.weekly_time.setTime(task_shift.QTime(17, 30))
+        specification = dialog.values()
+        self.assertEqual(specification.directive, "OnCalendar")
+        self.assertEqual(specification.value, "Fri *-*-* 17:30:00")
+        self.assertTrue(specification.persistent)
+        dialog.close()
+        parent.close()
 
     def test_selection_shows_timer_and_command(self) -> None:
         window = task_shift.TaskWindow(autoload=False)
