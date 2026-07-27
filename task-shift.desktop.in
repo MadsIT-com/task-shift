@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=TaskShift
+GenericName=Systemd Timer Manager
+Comment=Manage Debian scheduled tasks through a familiar KDE interface
+Exec=@TASK_SHIFT_EXEC@
+Icon=view-calendar-tasks
+Terminal=false
+Categories=System;Monitor;
+Keywords=systemd;timer;task;schedule;Task Scheduler;admin;
+StartupNotify=true
+StartupWMClass=task-shift
+NoDisplay=false

@@ -1,0 +1,622 @@
+#!/usr/bin/python3
+"""A native KDE landing point for existing Debian systemd timers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from typing import Callable
+
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QCloseEvent, QIcon
+from PyQt6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+TITLE = "TaskShift"
+VERSION = "0.1.0"
+SYSTEMCTL = "/usr/bin/systemctl"
+TIMER_PATTERN = re.compile(r"[A-Za-z0-9_.:@-]+\.timer")
+SERVICE_PATTERN = re.compile(r"[A-Za-z0-9_.:@-]+\.service")
+SCOPES = ("system", "user")
+ACTIONS = ("start", "stop", "enable", "disable", "run-now")
+_QT_APPLICATION: QApplication | None = None
+
+
+class TaskShiftError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class TimerUnit:
+    name: str
+    activates: str
+    next_usec: int
+    last_usec: int
+    active_state: str
+    sub_state: str
+    unit_file_state: str
+
+    @property
+    def state_label(self) -> str:
+        if self.active_state == "active" and self.sub_state:
+            return f"Active ({self.sub_state})"
+        if self.active_state == "failed":
+            return "Failed"
+        if self.active_state:
+            return self.active_state.capitalize()
+        return "Not loaded"
+
+
+def qt_application() -> QApplication:
+    global _QT_APPLICATION
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([sys.argv[0]])
+        application.setApplicationName(TITLE)
+        application.setApplicationDisplayName(TITLE)
+        application.setDesktopFileName("task-shift")
+        application.setWindowIcon(QIcon.fromTheme("view-calendar-tasks"))
+    assert isinstance(application, QApplication)
+    _QT_APPLICATION = application
+    return application
+
+
+def validate_scope(scope: str) -> str:
+    if scope not in SCOPES:
+        raise TaskShiftError("The timer scope is invalid.")
+    return scope
+
+
+def validate_timer_name(name: str) -> str:
+    if name.startswith("-") or not TIMER_PATTERN.fullmatch(name):
+        raise TaskShiftError("The selected timer name is invalid.")
+    return name
+
+
+def validate_service_name(name: str) -> str:
+    if name.startswith("-") or not SERVICE_PATTERN.fullmatch(name):
+        raise TaskShiftError("The timer does not expose a valid service to run.")
+    return name
+
+
+def systemctl_arguments(scope: str, *arguments: str) -> list[str]:
+    validate_scope(scope)
+    command = [SYSTEMCTL]
+    if scope == "user":
+        command.append("--user")
+    command.extend(arguments)
+    return command
+
+
+def display_command(scope: str, *arguments: str) -> str:
+    command = ["systemctl"]
+    if validate_scope(scope) == "user":
+        command.append("--user")
+    command.extend(arguments)
+    return shlex.join(command)
+
+
+def run_systemctl(scope: str, *arguments: str) -> str:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "LC_ALL": "C",
+            "SYSTEMD_PAGER": "",
+            "SYSTEMD_LESS": "",
+        }
+    )
+    try:
+        result = subprocess.run(
+            systemctl_arguments(scope, *arguments),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=30,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TaskShiftError(f"systemctl could not complete: {exc}") from exc
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        raise TaskShiftError(message or "systemctl did not complete successfully.")
+    return result.stdout
+
+
+def microseconds(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def format_timestamp(value: int) -> str:
+    if value <= 0:
+        return "—"
+    try:
+        moment = datetime.fromtimestamp(value / 1_000_000).astimezone()
+    except (OverflowError, OSError, ValueError):
+        return "—"
+    return moment.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def parse_timers(
+    schedule_text: str,
+    units_text: str,
+    files_text: str,
+) -> list[TimerUnit]:
+    try:
+        schedule = json.loads(schedule_text)
+        loaded = json.loads(units_text)
+        files = json.loads(files_text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise TaskShiftError("systemctl returned timer data in an unknown format.") from exc
+    if not all(isinstance(value, list) for value in (schedule, loaded, files)):
+        raise TaskShiftError("systemctl returned timer data in an unknown format.")
+
+    timers: dict[str, dict[str, object]] = {}
+    for record in schedule:
+        if not isinstance(record, dict):
+            continue
+        name = str(record.get("unit", ""))
+        if name.startswith("-") or not TIMER_PATTERN.fullmatch(name):
+            continue
+        activates = str(record.get("activates", ""))
+        if activates and (
+            activates.startswith("-") or not SERVICE_PATTERN.fullmatch(activates)
+        ):
+            activates = ""
+        timers[name] = {
+            "activates": activates,
+            "next": microseconds(record.get("next")),
+            "last": microseconds(record.get("last")),
+            "active": "",
+            "sub": "",
+            "file": "",
+        }
+
+    for record in loaded:
+        if not isinstance(record, dict):
+            continue
+        name = str(record.get("unit", ""))
+        if name.startswith("-") or not TIMER_PATTERN.fullmatch(name):
+            continue
+        values = timers.setdefault(
+            name,
+            {
+                "activates": "",
+                "next": 0,
+                "last": 0,
+                "active": "",
+                "sub": "",
+                "file": "",
+            },
+        )
+        values["active"] = str(record.get("active", ""))
+        values["sub"] = str(record.get("sub", ""))
+
+    for record in files:
+        if not isinstance(record, dict):
+            continue
+        name = str(record.get("unit_file", ""))
+        if (
+            name.startswith("-")
+            or not TIMER_PATTERN.fullmatch(name)
+            or "@." in name
+        ):
+            continue
+        values = timers.setdefault(
+            name,
+            {
+                "activates": "",
+                "next": 0,
+                "last": 0,
+                "active": "inactive",
+                "sub": "dead",
+                "file": "",
+            },
+        )
+        values["file"] = str(record.get("state", ""))
+
+    return [
+        TimerUnit(
+            name=name,
+            activates=str(values["activates"]),
+            next_usec=int(values["next"]),
+            last_usec=int(values["last"]),
+            active_state=str(values["active"]),
+            sub_state=str(values["sub"]),
+            unit_file_state=str(values["file"]) or "unknown",
+        )
+        for name, values in sorted(timers.items())
+    ]
+
+
+def load_timers(scope: str) -> list[TimerUnit]:
+    schedule = run_systemctl(scope, "list-timers", "--all", "--no-pager", "--output=json")
+    units = run_systemctl(
+        scope,
+        "list-units",
+        "--type=timer",
+        "--all",
+        "--no-pager",
+        "--output=json",
+    )
+    files = run_systemctl(
+        scope,
+        "list-unit-files",
+        "--type=timer",
+        "--no-pager",
+        "--output=json",
+    )
+    return parse_timers(schedule, units, files)
+
+
+def perform_action(scope: str, timer: TimerUnit, action: str) -> str:
+    validate_scope(scope)
+    validate_timer_name(timer.name)
+    if action not in ACTIONS:
+        raise TaskShiftError("The requested timer action is not allowed.")
+    if action == "run-now":
+        return run_systemctl(scope, "start", validate_service_name(timer.activates))
+    return run_systemctl(scope, action, timer.name)
+
+
+def action_command(scope: str, timer: TimerUnit, action: str) -> str:
+    validate_timer_name(timer.name)
+    if action == "run-now":
+        return display_command(scope, "start", validate_service_name(timer.activates))
+    if action not in ACTIONS:
+        raise TaskShiftError("The requested timer action is not allowed.")
+    return display_command(scope, action, timer.name)
+
+
+class BackgroundJob(QThread):
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, function: Callable[..., object], *arguments: object) -> None:
+        super().__init__()
+        self.function = function
+        self.arguments = arguments
+
+    def run(self) -> None:
+        try:
+            result = self.function(*self.arguments)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
+class TaskWindow(QMainWindow):
+    def __init__(self, *, autoload: bool = True) -> None:
+        super().__init__()
+        self.setWindowTitle(TITLE)
+        self.setWindowIcon(QIcon.fromTheme("view-calendar-tasks"))
+        self.setMinimumSize(980, 660)
+        self.timers: list[TimerUnit] = []
+        self.job: BackgroundJob | None = None
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        self.main_layout = QVBoxLayout(central)
+        self.main_layout.setContentsMargins(20, 18, 20, 16)
+        self.main_layout.setSpacing(12)
+
+        heading = QLabel("<b>Manage scheduled systemd tasks</b>")
+        explanation = QLabel(
+            "A Task Scheduler-style view of existing Debian timers. TaskShift "
+            "stores no task inventory or history and does not create or rewrite "
+            "timer files in this preview."
+        )
+        explanation.setWordWrap(True)
+        self.main_layout.addWidget(heading)
+        self.main_layout.addWidget(explanation)
+
+        self.find_group = QGroupBox("Find scheduled tasks")
+        find_layout = QHBoxLayout(self.find_group)
+        find_layout.setContentsMargins(12, 12, 12, 12)
+        find_layout.setSpacing(10)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Filter by timer or activated service")
+        self.scope = QComboBox()
+        self.scope.addItem("System timers", "system")
+        self.scope.addItem("User timers", "user")
+        self.state_filter = QComboBox()
+        self.state_filter.addItems(("All states", "Active", "Inactive", "Failed"))
+        self.refresh_button = QPushButton("Refresh")
+        find_layout.addWidget(QLabel("Search:"))
+        find_layout.addWidget(self.search, 1)
+        find_layout.addWidget(QLabel("Scope:"))
+        find_layout.addWidget(self.scope)
+        find_layout.addWidget(QLabel("State:"))
+        find_layout.addWidget(self.state_filter)
+        find_layout.addWidget(self.refresh_button)
+        self.main_layout.addWidget(self.find_group)
+
+        self.timers_group = QGroupBox("Scheduled tasks")
+        timers_layout = QVBoxLayout(self.timers_group)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ("Timer", "Next run", "Last run", "Startup", "Runs")
+        )
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        timers_layout.addWidget(self.table)
+        self.main_layout.addWidget(self.timers_group, 1)
+
+        self.details_group = QGroupBox("Selected scheduled task")
+        details_layout = QVBoxLayout(self.details_group)
+        details_layout.setSpacing(10)
+        details_form = QFormLayout()
+        details_form.setHorizontalSpacing(12)
+        details_form.setVerticalSpacing(8)
+        self.selected_timer = QLabel("Select a timer")
+        self.selected_target = QLabel("—")
+        self.selected_state = QLabel("—")
+        self.command_preview = QLineEdit()
+        self.command_preview.setReadOnly(True)
+        self.command_preview.setPlaceholderText("Select a timer to see its terminal command")
+        details_form.addRow("Timer:", self.selected_timer)
+        details_form.addRow("Runs:", self.selected_target)
+        details_form.addRow("State:", self.selected_state)
+        details_form.addRow("Inspect in a terminal:", self.command_preview)
+        details_layout.addLayout(details_form)
+
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(8)
+        self.start_button = QPushButton("Start timer")
+        self.stop_button = QPushButton("Stop timer")
+        self.run_button = QPushButton("Run task now")
+        self.enable_button = QPushButton("Enable at startup")
+        self.disable_button = QPushButton("Disable at startup")
+        self.action_buttons = {
+            "start": self.start_button,
+            "stop": self.stop_button,
+            "run-now": self.run_button,
+            "enable": self.enable_button,
+            "disable": self.disable_button,
+        }
+        for action, button in self.action_buttons.items():
+            button.setEnabled(False)
+            button.clicked.connect(lambda checked=False, name=action: self.run_action(name))
+            action_layout.addWidget(button)
+        action_layout.addStretch(1)
+        details_layout.addLayout(action_layout)
+        self.main_layout.addWidget(self.details_group)
+
+        status_layout = QHBoxLayout()
+        self.status = QLabel("Ready")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setFixedWidth(150)
+        self.progress.hide()
+        status_layout.addWidget(self.status, 1)
+        status_layout.addWidget(self.progress)
+        self.main_layout.addLayout(status_layout)
+
+        self.search.textChanged.connect(self.apply_filter)
+        self.state_filter.currentTextChanged.connect(self.apply_filter)
+        self.scope.currentIndexChanged.connect(self.refresh)
+        self.refresh_button.clicked.connect(self.refresh)
+        self.table.itemSelectionChanged.connect(self.update_selection)
+        if autoload:
+            QTimer.singleShot(0, self.refresh)
+
+    def current_scope(self) -> str:
+        return str(self.scope.currentData())
+
+    def selected(self) -> TimerUnit | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        timer = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return timer if isinstance(timer, TimerUnit) else None
+
+    def set_busy(self, message: str) -> None:
+        self.status.setText(message)
+        self.progress.show()
+        self.refresh_button.setEnabled(False)
+        self.scope.setEnabled(False)
+        for button in self.action_buttons.values():
+            button.setEnabled(False)
+
+    def clear_busy(self, message: str) -> None:
+        self.status.setText(message)
+        self.progress.hide()
+        self.refresh_button.setEnabled(True)
+        self.scope.setEnabled(True)
+        self.update_selection()
+
+    def start_job(
+        self,
+        function: Callable[..., object],
+        arguments: tuple[object, ...],
+        message: str,
+        on_success: Callable[[object], None],
+    ) -> None:
+        if self.job is not None and self.job.isRunning():
+            return
+        self.set_busy(message)
+        job = BackgroundJob(function, *arguments)
+        self.job = job
+
+        def succeeded(result: object) -> None:
+            self.job = None
+            on_success(result)
+
+        def failed(message_text: str) -> None:
+            self.job = None
+            self.clear_busy("The operation did not complete")
+            QMessageBox.critical(self, TITLE, message_text)
+
+        job.succeeded.connect(succeeded)
+        job.failed.connect(failed)
+        job.finished.connect(job.deleteLater)
+        job.start()
+
+    def refresh(self) -> None:
+        scope = self.current_scope()
+        self.start_job(
+            load_timers,
+            (scope,),
+            f"Loading {scope} timers…",
+            self.timers_loaded,
+        )
+
+    def timers_loaded(self, result: object) -> None:
+        assert isinstance(result, list)
+        self.timers = result
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(self.timers))
+        for row, timer in enumerate(self.timers):
+            name = QTableWidgetItem(timer.name)
+            name.setData(Qt.ItemDataRole.UserRole, timer)
+            self.table.setItem(row, 0, name)
+            self.table.setItem(row, 1, QTableWidgetItem(format_timestamp(timer.next_usec)))
+            self.table.setItem(row, 2, QTableWidgetItem(format_timestamp(timer.last_usec)))
+            self.table.setItem(row, 3, QTableWidgetItem(timer.unit_file_state))
+            self.table.setItem(row, 4, QTableWidgetItem(timer.activates or "—"))
+        self.table.setSortingEnabled(True)
+        self.apply_filter()
+        self.clear_busy(f"Loaded {len(self.timers)} {self.current_scope()} timers")
+
+    def apply_filter(self) -> None:
+        query = self.search.text().strip().casefold()
+        requested_state = self.state_filter.currentText().casefold()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            timer = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if not isinstance(timer, TimerUnit):
+                self.table.setRowHidden(row, True)
+                continue
+            text_match = not query or query in f"{timer.name} {timer.activates}".casefold()
+            state_match = requested_state == "all states"
+            if requested_state == "active":
+                state_match = timer.active_state == "active"
+            elif requested_state == "inactive":
+                state_match = timer.active_state == "inactive"
+            elif requested_state == "failed":
+                state_match = timer.active_state == "failed"
+            self.table.setRowHidden(row, not (text_match and state_match))
+
+    def update_selection(self) -> None:
+        timer = self.selected()
+        busy = self.job is not None and self.job.isRunning()
+        for action, button in self.action_buttons.items():
+            enabled = timer is not None and not busy
+            if action == "run-now" and timer is not None:
+                enabled = enabled and bool(timer.activates)
+            button.setEnabled(enabled)
+        if timer is None:
+            self.selected_timer.setText("Select a timer")
+            self.selected_target.setText("—")
+            self.selected_state.setText("—")
+            self.command_preview.clear()
+            return
+        self.selected_timer.setText(timer.name)
+        self.selected_target.setText(timer.activates or "No activated service reported")
+        self.selected_state.setText(
+            f"{timer.state_label}; startup: {timer.unit_file_state}"
+        )
+        self.command_preview.setText(
+            display_command(self.current_scope(), "status", timer.name)
+        )
+
+    def run_action(self, action: str) -> None:
+        timer = self.selected()
+        if timer is None:
+            return
+        try:
+            command = action_command(self.current_scope(), timer, action)
+        except TaskShiftError as exc:
+            QMessageBox.critical(self, TITLE, str(exc))
+            return
+        if action in {"stop", "disable", "run-now"}:
+            consequences = {
+                "stop": "Stopping a timer prevents its next scheduled run until it is started again.",
+                "disable": "Disabling a timer changes whether it starts automatically.",
+                "run-now": "Running the activated service now may perform updates, cleanup, or other work immediately.",
+            }[action]
+            answer = QMessageBox.question(
+                self,
+                TITLE,
+                f"{consequences}\n\nRun this command?\n{command}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.command_preview.setText(command)
+
+        def completed(_: object) -> None:
+            self.clear_busy(f"Completed: {command}")
+            QTimer.singleShot(0, self.refresh)
+
+        self.start_job(
+            perform_action,
+            (self.current_scope(), timer, action),
+            f"Running {command}… KDE may request administrator authentication.",
+            completed,
+        )
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.job is not None and self.job.isRunning():
+            QMessageBox.information(
+                self,
+                TITLE,
+                "A systemd request is still finishing. Close TaskShift when it completes.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+def main() -> int:
+    if "--version" in sys.argv:
+        print(f"{TITLE} {VERSION}")
+        return 0
+    application = qt_application()
+    window = TaskWindow()
+    window.show()
+    return application.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
