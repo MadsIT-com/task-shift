@@ -1,7 +1,7 @@
 # Contributing
 
-TaskShift is intentionally small. During private testing, keep changes focused
-on a dependable Task Scheduler-style landing point for existing systemd timers.
+TaskShift is intentionally small. Keep changes focused on a dependable Task
+Scheduler-style landing point for existing systemd timers.
 
 Before submitting a change:
 
@@ -16,5 +16,4 @@ Before submitting a change:
    calendars with `systemd-analyze`, and preserve an explicit rollback path.
 
 Systemd must remain the scheduler. Complete task creation, arbitrary unit-file
-editing, and arbitrary command execution are outside the private preview's
-scope.
+editing, and arbitrary command execution are outside the current scope.

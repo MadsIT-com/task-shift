@@ -8,7 +8,7 @@ systemd timers. It gives Windows administrators a familiar scheduled-task
 overview while leaving scheduling, execution, and authorization with Debian's
 native systemd packages.
 
-**Current private preview: 0.2.0**
+**Current release: 0.2.0**
 
 ## Behavior
 
@@ -30,7 +30,7 @@ native systemd packages.
   asks for or handles an administrator password.
 - Saves no timer inventory, search history, selected unit, or action history.
 
-This preview changes when an existing timer runs, but deliberately does not
+TaskShift changes when an existing timer runs, but deliberately does not
 create or delete timer and service units. Creating a complete task still needs
 a design that explains the two-unit model, file ownership, command execution,
 validation, and rollback before it writes anything.
