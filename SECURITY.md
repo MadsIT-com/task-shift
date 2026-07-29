@@ -2,10 +2,9 @@
 
 ## Reporting a vulnerability
 
-While this repository is private, report suspected vulnerabilities directly to
-the repository owner. Do not place credentials, private timer data, or
-machine-specific logs in an issue. Private vulnerability reporting will be
-enabled before the repository becomes public.
+Use GitHub's private vulnerability reporting for suspected security issues.
+Do not place credentials, private timer data, or machine-specific logs in a
+public issue.
 
 ## Security model
 
@@ -55,5 +54,5 @@ drop-in.
   later than the selected wall-clock time by design.
 - The `pkexec` package is a setuid PolicyKit component. It is used because
   unprivileged `systemctl edit` cannot write system timer configuration.
-- This preview does not create or delete complete tasks and does not accept or
+- TaskShift does not create or delete complete tasks and does not accept or
   run arbitrary commands.
